@@ -1,0 +1,120 @@
+
+name: Check and package
+
+on:
+  push:
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+
+  pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check and package (${{ matrix.platform }})
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux
+          - os: windows-2025
+            platform: windows
+
+    runs-on: ${{ matrix.os }}
+
+    env:
+      QT_QPA_PLATFORM: offscreen
+      NODEBATCH_TEST_LOOPBACK: "1"
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      # Checkout repository
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      # Python environment
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev-lock.txt
+
+      # Linux: required native Qt libraries
+      - name: Install Linux Qt dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        timeout-minutes: 8
+        run: |
+          # Bypass the runner's mirror list: its Azure DNS can fail independently
+          # of the official Ubuntu archives. Scope these sources to this step.
+          qt_sources="${RUNNER_TEMP}/nodebatch-qt-sources.list"
+          qt_sourceparts="${RUNNER_TEMP}/nodebatch-qt-sources.list.d"
+          mkdir -p "$qt_sourceparts"
+          cat > "$qt_sources" <<'EOF'
+          deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://archive.ubuntu.com/ubuntu noble main
+          deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://archive.ubuntu.com/ubuntu noble-updates main
+          deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://security.ubuntu.com/ubuntu noble-security main
+          EOF
+          apt_options=(
+            -o "Dir::Etc::sourcelist=$qt_sources"
+            -o "Dir::Etc::sourceparts=$qt_sourceparts"
+            -o "Acquire::Retries=3"
+            -o "Acquire::https::Timeout=20"
+            -o "APT::Update::Error-Mode=any"
+          )
+          sudo apt-get "${apt_options[@]}" update
+          sudo apt-get "${apt_options[@]}" install -y --no-install-recommends \
+            libegl1 \
+            libgl1
+
+      # Python dependencies
+      - name: Install development dependencies
+        run: python -m pip install -r requirements-dev-lock.txt
+
+      # Install project
+      - name: Install NodeBatch
+        run: python -m pip install --no-deps --no-build-isolation -e .
+
+      # Repository checks
+      - name: Check repository
+        run: python tools/check_repo.py
+
+      # Unit and integration tests
+      - name: Run pytest
+        run: python -m pytest -q
+
+      # Application smoke test
+      - name: Run smoke test
+        run: >-
+          python -m nodebatch
+          --config-dir .local-config
+          --data-dir .local-data
+          --smoke-test
+
+      # Package application
+      - name: Build application
+        run: python tools/build.py
+
+      # Verify packaged application
+      - name: Verify bundle
+        run: python tools/verify_bundle.py
+
+      # Upload build artifacts
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: NodeBatch-${{ matrix.platform }}
+          path: dist/${{ matrix.platform }}/NodeBatch/
+          if-no-files-found: error
+          retention-days: 14

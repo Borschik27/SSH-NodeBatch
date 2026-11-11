@@ -1,0 +1,11 @@
+id: system-info
+name: System information
+description: Read-only example. Shows the operating system and current user.
+os: [unix]
+shells: [sh, bash]
+parameters: {}
+steps:
+  - name: Show system and user
+    command: |
+      uname -a
+      id

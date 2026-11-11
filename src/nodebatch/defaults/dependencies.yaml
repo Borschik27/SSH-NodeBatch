@@ -1,0 +1,10 @@
+version: 1
+# Commands are trusted local installer settings; no actions run on remote SSH hosts.
+windows_openssh: [powershell.exe, -NoProfile, -Command, 'Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0']
+wsl_install: [wsl.exe, --install, --distribution, '{distribution}', --no-launch]
+linux:
+  apt-get: [sh, -c, 'apt-get update && apt-get install -y openssh-client']
+  dnf: [dnf, install, -y, openssh-clients]
+  yum: [yum, install, -y, openssh-clients]
+  zypper: [zypper, --non-interactive, install, openssh-clients]
+  pacman: [pacman, -S, --needed, --noconfirm, openssh]

@@ -1,0 +1,4 @@
+# Verified runtime versions; Python 3.12+; Linux glibc 2.34+ for these Qt wheels.
+PySide6-Essentials==6.12.0
+shiboken6==6.12.0
+PyYAML==6.0.3

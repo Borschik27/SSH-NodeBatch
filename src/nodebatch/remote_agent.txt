@@ -1,0 +1,242 @@
+# NodeBatch wire protocol v2. This source is passed to python3 -u -c, without data.
+"""Unix remote helper: isolated program streams, anonymous secret descriptors."""
+import base64
+import array
+from collections import deque
+import fcntl
+import json
+import os
+import re
+import selectors
+import subprocess
+import sys
+import time
+import termios
+
+DRAIN_SECONDS = 1.0
+QUEUE_LIMIT = 256 * 1024
+CONTROL_RESERVE = 1024
+DATA_FRAME_SPACE = 24 * 1024
+
+
+class Outbox:
+    """Bounded wire queue; only nonblocking writes touch the transport."""
+    def __init__(self):
+        self.fd = sys.stdout.fileno()
+        os.set_blocking(self.fd, False)
+        self.pending = deque()
+        self.size = 0
+        self.offset = 0
+
+    def send(self, message):
+        data = (json.dumps(message, separators=(",", ":")) + "\n").encode("ascii")
+        if self.size + len(data) > QUEUE_LIMIT:
+            raise BufferError("Wire queue capacity exceeded")
+        self.pending.append(data)
+        self.size += len(data)
+
+    def write(self):
+        if not self.pending:
+            return
+        try:
+            written = os.write(self.fd, memoryview(self.pending[0])[self.offset:])
+        except BlockingIOError:
+            return
+        if not written:
+            raise BrokenPipeError()
+        self.size -= written
+        self.offset += written
+        if self.offset == len(self.pending[0]):
+            self.pending.popleft()
+            self.offset = 0
+
+    def drain(self):
+        # Delivery has no one-second deadline. The client's execution timeout
+        # and SSH connection lifetime bound a stalled receiver instead.
+        with selectors.PollSelector() as selector:
+            selector.register(self.fd, selectors.EVENT_WRITE)
+            while self.pending:
+                if selector.select(timeout=.05):
+                    self.write()
+
+
+def buffered_bytes(stream):
+    """Snapshot pipe bytes already present when shell completion is observed."""
+    count = array.array("i", [0])
+    fcntl.ioctl(stream.fileno(), termios.FIONREAD, count, True)
+    return count[0]
+
+
+def main():
+    outbox = Outbox()
+    send = outbox.send
+
+    ready = {"v": 2, "type": "ready"}
+    if len(sys.argv) > 1 and sys.argv[1]:
+        ready["session"] = sys.argv[1]
+    send(ready)
+    outbox.drain()
+    raw = sys.stdin.buffer.readline(1048577)
+    if len(raw) > 1048576 or not raw.endswith(b"\n"):
+        return 125
+    payload = json.loads(raw)
+    token = payload["token"]
+    if not re.fullmatch(r"[a-f0-9]{64}", token):
+        return 125
+    def frame(kind, **values):
+        send(dict(v=2, type=kind, token=token, **values))
+    read_fds = []
+    process = None
+    preparation_reason = "preparation_failed"
+    try:
+        if payload["shell"] not in ("sh", "bash"):
+            raise ValueError()
+        if not isinstance(payload["command"], str) or len(payload["command"].encode("utf-8")) > 32768:
+            preparation_reason = "command_too_large"
+            raise ValueError()
+        secrets = payload.get("secrets", {})
+        if len(secrets) > 32:
+            raise ValueError()
+        env = dict(os.environ)
+        for key in list(env):
+            if key.startswith("NODEBATCH_SECRET_"):
+                del env[key]
+        for name, value in secrets.items():
+            if not re.fullmatch(r"[A-Za-z_]\w*", name, re.ASCII):
+                raise ValueError()
+            data = value.encode("utf-8")
+            if len(data) > 4096:
+                raise ValueError()
+            reader, writer = os.pipe()
+            read_fds.append(reader)
+            try:
+                os.write(writer, data)
+            finally:
+                os.close(writer)
+            env["NODEBATCH_SECRET_" + name + "_FD"] = str(reader)
+        # stdin is never shared with sudo, the wire reader, or secret pipes.
+        # Refuse unsupported platforms before launching user code rather than
+        # applying a lossy guessed pipe-size bound after shell completion.
+        if not hasattr(termios, "FIONREAD"):
+            raise NotImplementedError()
+        try:
+            process = subprocess.Popen([payload["shell"], "-c", payload["command"]],
+                                       stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, env=env, pass_fds=tuple(read_fds))
+        except FileNotFoundError:
+            preparation_reason = "shell_unavailable"
+            raise
+        except OSError:
+            preparation_reason = "process_creation_failed"
+            raise
+        frame("started")
+        for fd in read_fds:
+            os.close(fd)
+        read_fds.clear()
+        output_incomplete = False
+        drain_deadline = None
+        exit_buffered = None
+        result_sent = False
+        streams = {"stdout": process.stdout, "stderr": process.stderr}
+        for stream in streams.values():
+            os.set_blocking(stream.fileno(), False)
+        with selectors.PollSelector() as selector:
+            def interest(file, events, channel):
+                try:
+                    key = selector.get_key(file)
+                except KeyError:
+                    if events:
+                        selector.register(file, events, channel)
+                else:
+                    if not events:
+                        selector.unregister(file)
+                    elif key.events != events:
+                        selector.modify(file, events, channel)
+
+            def close_stream(channel):
+                stream = streams.pop(channel)
+                interest(stream, 0, channel)
+                stream.close()
+
+            def data_frame(channel, data):
+                frame("data", channel=channel, data=base64.b64encode(data).decode("ascii"))
+
+            while True:
+                code = process.poll()
+                if code is not None and exit_buffered is None:
+                    # Always preserve the observed foreground tail, even when
+                    # delivery is stalled. New descendant bytes have a separate
+                    # wall-clock acceptance window, independent of wire writes.
+                    exit_buffered = {channel: buffered_bytes(stream) for channel, stream in streams.items()}
+                    drain_deadline = time.monotonic() + DRAIN_SECONDS
+                expired = drain_deadline is not None and time.monotonic() >= drain_deadline
+                if expired:
+                    for channel, stream in list(streams.items()):
+                        if exit_buffered[channel]:
+                            continue
+                        # Distinguish EOF from an inherited writer. A one-byte
+                        # probe uses reserved control space and is also retained.
+                        try:
+                            probe = os.read(stream.fileno(), 1)
+                        except BlockingIOError:
+                            probe = None
+                        if probe:
+                            data_frame(channel, probe)
+                        output_incomplete |= probe != b""
+                        close_stream(channel)
+                if not streams and code is not None and not result_sent:
+                    frame("result", code=code, output_incomplete=output_incomplete)
+                    result_sent = True
+                if result_sent and not outbox.pending:
+                    break
+                room = outbox.size + DATA_FRAME_SPACE + CONTROL_RESERVE <= QUEUE_LIMIT
+                for channel, stream in streams.items():
+                    interest(stream, selectors.EVENT_READ if room else 0, channel)
+                interest(outbox.fd, selectors.EVENT_WRITE if outbox.pending else 0, "wire")
+                for key, _ in selector.select(timeout=.05):
+                    if key.data == "wire":
+                        outbox.write()
+                        continue
+                    # Reserve enough space independently for each ready channel.
+                    if outbox.size + DATA_FRAME_SPACE + CONTROL_RESERVE > QUEUE_LIMIT:
+                        continue
+                    channel = key.data
+                    size = 16384
+                    if drain_deadline is not None and time.monotonic() >= drain_deadline:
+                        size = min(size, exit_buffered[channel])
+                        if not size:
+                            continue
+                    try:
+                        data = os.read(key.fileobj.fileno(), size)
+                    except BlockingIOError:
+                        continue
+                    if data:
+                        data_frame(channel, data)
+                        if exit_buffered is not None:
+                            exit_buffered[channel] = max(0, exit_buffered[channel] - len(data))
+                    else:
+                        close_stream(channel)
+        return 0
+    except (BrokenPipeError, ConnectionResetError):
+        return 125
+    except Exception:
+        # Never expose exceptions containing request data, argv, or secret values.
+        if process is None:
+            frame("not_started", reason=preparation_reason)
+        else:
+            frame("error", reason="execution_failed")
+        outbox.drain()
+        return 125
+    finally:
+        for fd in read_fds:
+            os.close(fd)
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
+        if process is not None:
+            process.stdout.close()
+            process.stderr.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

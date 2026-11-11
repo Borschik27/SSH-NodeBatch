@@ -1,0 +1,32 @@
+version: 1
+language: auto
+active_profile: native
+profiles:
+  native:
+    backend: native
+    ssh: ssh
+    sftp: sftp
+    config: ''
+    keys: []
+    known_hosts: ''
+    wsl_distribution: ''
+    wsl_home: ''
+execution:
+  mode: sequential
+  parallelism: 4
+  stop_on_error: true
+  connect_timeout: 10
+  step_timeout: 600
+  auth_timeout: 120
+  sudo_user: root
+logging:
+  retention_days: 30
+  max_bytes: 1073741824
+  run_max_bytes: 268435456
+  history_max_bytes: 1073741824
+  min_free_bytes: 16777216
+  gui_blocks: 2000
+  verbose: false
+watch:
+  debounce_ms: 500
+  poll_ms: 2000

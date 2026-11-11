@@ -1,0 +1,12 @@
+version: 1
+# Same alias enriches an SSH alias. Examples are not active.
+hosts: []
+groups: {}
+# - alias: worker-01
+#   address: 192.0.2.10
+#   user: operator
+#   port: 22
+#   groups: [workers]
+#   tags: [production]
+#   os: linux
+#   shell: sh

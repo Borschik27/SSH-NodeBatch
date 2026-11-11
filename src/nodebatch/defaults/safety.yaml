@@ -1,0 +1,36 @@
+version: 1
+rules:
+- id: destructive-tools
+  action: deny
+  pattern: (?i)(?:^|[\s;|&(/])(?:mkfs(?:\.[\w-]+)?|wipefs|shred|fdisk|sfdisk|parted|newfs|disklabel)(?:\s|$)
+  explanation: Formatting or destructive disk changes are blocked.
+- id: device-write
+  action: deny
+  pattern: (?i)(?:\bdd\b[^\n;]*\bof\s*=\s*["\x27]?/dev/|>{1,2}\s*["\x27]?/dev/(?!null\b|stdout\b|stderr\b))
+  explanation: Direct writes to devices are blocked.
+- id: root-tree-removal
+  action: deny
+  pattern: (?i)\b(?:rm|rmdir)\b[^\n;|&]*\s["\x27]?/(?:["\x27]?(?:\s|$)|\*|(?:etc|usr|var|boot|bin|sbin|lib\d*|root|home|dev|sys|proc)(?:/[^\s;]*)?(?:["\x27]?(?:\s|$)))
+  explanation: Removing root or system directories is blocked.
+- id: fork-bomb
+  action: deny
+  pattern: :\s*\(\s*\)\s*\{
+  explanation: A fork bomb pattern was detected.
+- id: changing-operation
+  action: confirm
+  pattern: (?i)\b(?:sudo|su|apt(?:-get|-mark)?|dnf|yum|rpm|dpkg|pkg|pkg_add|pkg_delete|pacman|zypper|systemctl|service|shutdown|reboot|halt|poweroff|mount|umount|chmod|chown|rm|mv|cp|tee|sed)\b|>{1,2}
+  explanation: This command may change the system.
+- id: opaque-shell
+  action: confirm
+  pattern: (?i)\$|\x60|\b(?:eval|exec|source|curl|wget|python\d*|perl|ruby|base64|xargs|find|ssh|bash|sh)\b|[;&|()]
+  explanation: Complex shell expressions and other interpreters require review.
+- id: system-destination
+  action: confirm
+  target: destination
+  pattern: ^/(?:etc|usr|var|boot|bin|sbin|lib|root|opt)(?:/|$)
+  explanation: File transfer targets a system directory.
+- id: device-destination
+  action: deny
+  target: destination
+  pattern: ^/(?:dev|proc|sys)(?:/|$)
+  explanation: File transfer to devices or virtual filesystems is blocked.

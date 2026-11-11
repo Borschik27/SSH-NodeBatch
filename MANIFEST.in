@@ -1,0 +1,19 @@
+include README.md README.ru.md CHANGELOG.md LICENSE
+include THIRD_PARTY.md
+recursive-include licenses *.txt
+include requirements*.txt .gitignore .gitattributes
+recursive-include .github *.yml *.yaml
+recursive-include docs *.md
+recursive-include tests *.py
+recursive-include tools *.py
+prune .local
+prune .work
+prune .test-temp
+prune .local-config
+prune .local-data
+prune .local-data-linux
+prune .venv
+prune .venv-linux
+prune build
+prune dist
+global-exclude __pycache__ *.py[cod] *.sqlite3 *.sqlite3-* *.db *.db-* *.jsonl *.log *.pem *.key *.p12 *.pfx .env .env.*
